@@ -117,6 +117,7 @@ type Channel struct {
 	Type    string            `yaml:"type"`
 	URL     string            `yaml:"url"`
 	Headers map[string]string `yaml:"headers"`
+	Secret  string            `yaml:"secret"`
 	SMTP    SMTP              `yaml:"smtp"`
 }
 
