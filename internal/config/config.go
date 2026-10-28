@@ -67,8 +67,9 @@ type Retention struct {
 
 // Scheduler tunes check execution.
 type Scheduler struct {
-	Workers int     `yaml:"workers"`
-	Jitter  float64 `yaml:"jitter"`
+	Workers int `yaml:"workers"`
+	// Jitter is a fraction of the interval; nil means the default of 0.1.
+	Jitter *float64 `yaml:"jitter"`
 }
 
 // Defaults are applied to services that leave a field unset.
@@ -269,8 +270,9 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.Workers == 0 {
 		c.Scheduler.Workers = 8
 	}
-	if c.Scheduler.Jitter == 0 {
-		c.Scheduler.Jitter = 0.1
+	if c.Scheduler.Jitter == nil {
+		j := 0.1
+		c.Scheduler.Jitter = &j
 	}
 
 	d := &c.Defaults
@@ -351,7 +353,7 @@ func (c *Config) Validate() error {
 	if c.Scheduler.Workers < 1 || c.Scheduler.Workers > 1024 {
 		add("scheduler.workers must be between 1 and 1024")
 	}
-	if c.Scheduler.Jitter < 0 || c.Scheduler.Jitter > 0.5 {
+	if j := *c.Scheduler.Jitter; j < 0 || j > 0.5 {
 		add("scheduler.jitter must be between 0 and 0.5")
 	}
 	if c.Server.PublicURL != "" {

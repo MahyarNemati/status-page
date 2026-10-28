@@ -53,12 +53,15 @@ type Manager struct {
 }
 
 type state struct {
-	last     check.Status
-	downRun  int
-	upRun    int
-	changes  []time.Time
-	flapping bool
-	open     *store.Incident
+	last    check.Status
+	downRun int
+	upRun   int
+	// downSince is when the current run of failures began; incidents are
+	// backdated to it so durations reflect the real outage.
+	downSince time.Time
+	changes   []time.Time
+	flapping  bool
+	open      *store.Incident
 }
 
 // NewManager returns a Manager. pub may be nil to disable notifications.
@@ -136,6 +139,9 @@ func (m *Manager) Observe(ctx context.Context, svc config.Service, res check.Res
 		st.upRun++
 		st.downRun = 0
 	} else {
+		if st.downRun == 0 {
+			st.downSince = at
+		}
 		st.downRun++
 		st.upRun = 0
 	}
@@ -149,12 +155,12 @@ func (m *Manager) Observe(ctx context.Context, svc config.Service, res check.Res
 
 	switch {
 	case st.open == nil && (st.downRun >= svc.FailureThreshold || st.flapping):
-		title, severity := svc.Name+" is down", SeverityMajor
+		title, severity, started := svc.Name+" is down", SeverityMajor, st.downSince
 		if st.downRun < svc.FailureThreshold {
-			title, severity = svc.Name+" is unstable", SeverityMinor
+			title, severity, started = svc.Name+" is unstable", SeverityMinor, at
 		}
 		in, err := m.store.CreateIncident(ctx, store.Incident{
-			ServiceID: svc.ID, Title: title, Severity: severity, Auto: true, StartedAt: at,
+			ServiceID: svc.ID, Title: title, Severity: severity, Auto: true, StartedAt: started,
 		})
 		if err != nil {
 			return err

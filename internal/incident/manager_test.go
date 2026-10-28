@@ -89,7 +89,7 @@ func TestOpenAndResolveWithThresholds(t *testing.T) {
 	if len(open) != 1 || !open[0].Auto || open[0].Severity != SeverityMajor || open[0].Title != "API is down" {
 		t.Fatalf("open incidents = %+v", open)
 	}
-	if !open[0].StartedAt.Equal(t0.Add(11 * time.Minute)) {
+	if !open[0].StartedAt.Equal(t0.Add(10 * time.Minute)) {
 		t.Fatalf("started at %v", open[0].StartedAt)
 	}
 
