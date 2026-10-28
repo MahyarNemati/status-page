@@ -1,0 +1,10 @@
+/bin/
+/dist/
+/statuspage
+*.db
+*.db-shm
+*.db-wal
+*.out
+coverage.*
+.env
+/data/
