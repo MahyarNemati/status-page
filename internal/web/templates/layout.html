@@ -1,0 +1,36 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>{{.}}</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+</head>
+<body>
+<main class="wrap">
+{{end}}
+
+{{define "foot"}}
+<footer class="foot">
+  <a href="/api/v1/status">JSON API</a>
+  <span aria-hidden="true">&middot;</span>
+  <a href="/metrics">Metrics</a>
+</footer>
+</main>
+</body>
+</html>
+{{end}}
+
+{{define "notes"}}
+<ol class="notes">
+  {{range .}}
+  <li>
+    <time datetime="{{iso .CreatedAt}}">{{date .CreatedAt}}</time>
+    <span class="author">{{.Author}}</span>
+    <p>{{.Body}}</p>
+  </li>
+  {{end}}
+</ol>
+{{end}}

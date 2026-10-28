@@ -1,0 +1,19 @@
+{{define "incident.html"}}{{template "head" .Title}}
+<header class="top">
+  <h1><a href="/">{{.Title}}</a></h1>
+</header>
+{{with .Incident}}
+<article class="incident-detail sev-{{.Severity}}">
+  <h2>{{.Title}}</h2>
+  <p class="meta">
+    {{$.Service}} &middot; {{.Severity}} &middot;
+    {{if eq .State "open"}}ongoing for {{incidentDuration .}}{{else}}resolved {{date .ResolvedAt}}, lasted {{incidentDuration .}}{{end}}
+    {{if .Auto}}&middot; detected automatically{{end}}
+  </p>
+  <p class="meta">Started {{date .StartedAt}}</p>
+  <h3>Updates</h3>
+  {{if .Notes}}{{template "notes" .Notes}}{{else}}<p class="empty">No updates yet.</p>{{end}}
+</article>
+{{end}}
+<p><a href="/">&larr; Back to status</a></p>
+{{template "foot"}}{{end}}

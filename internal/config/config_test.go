@@ -40,7 +40,7 @@ func TestParseAppliesDefaults(t *testing.T) {
 func TestParseEnvExpansionAndOverrides(t *testing.T) {
 	doc := `
 server:
-  admin_token: from-file
+  admin_token: from-file-0123456789
 alerts:
   channels:
     - name: ops
@@ -54,7 +54,7 @@ services:
 `
 	cfg, err := Parse([]byte(doc), env(map[string]string{
 		"SLACK_URL":              "https://hooks.slack.test/abc",
-		"STATUSPAGE_ADMIN_TOKEN": "from-env",
+		"STATUSPAGE_ADMIN_TOKEN": "from-env-0123456789",
 		"STATUSPAGE_WORKERS":     "3",
 	}))
 	if err != nil {
@@ -63,7 +63,7 @@ services:
 	if cfg.Alerts.Channels[0].URL != "https://hooks.slack.test/abc" {
 		t.Fatalf("url = %q", cfg.Alerts.Channels[0].URL)
 	}
-	if cfg.Server.AdminToken != "from-env" || cfg.Scheduler.Workers != 3 {
+	if cfg.Server.AdminToken != "from-env-0123456789" || cfg.Scheduler.Workers != 3 {
 		t.Fatalf("env overrides not applied: %+v %+v", cfg.Server, cfg.Scheduler)
 	}
 }
@@ -130,5 +130,12 @@ func TestParseDuration(t *testing.T) {
 	}
 	if _, err := ParseDuration("1.5d"); err == nil {
 		t.Error("expected error for fractional days")
+	}
+}
+
+func TestShortAdminTokenRejected(t *testing.T) {
+	_, err := Parse([]byte("server:\n  admin_token: short\n"), env(nil))
+	if err == nil || !strings.Contains(err.Error(), "admin_token") {
+		t.Fatalf("err = %v", err)
 	}
 }

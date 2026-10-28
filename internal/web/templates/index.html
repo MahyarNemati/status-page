@@ -1,0 +1,68 @@
+{{define "index.html"}}{{template "head" .Title}}
+<header class="top">
+  <h1>{{.Title}}</h1>
+</header>
+
+<section class="banner banner-{{.Level}}" aria-live="polite">
+  <span class="dot dot-{{.Level}}" aria-hidden="true"></span>
+  <strong>{{.Headline}}</strong>
+  <time datetime="{{iso .GeneratedAt}}">Updated {{date .GeneratedAt}}</time>
+</section>
+
+{{if .Active}}
+<section class="incidents active">
+  <h2>Active incidents</h2>
+  {{range .Active}}
+  <article class="incident sev-{{.Severity}}">
+    <h3><a href="/incidents/{{.ID}}">{{.Title}}</a></h3>
+    <p class="meta">{{$.ServiceName .ServiceID}} &middot; {{.Severity}} &middot; started {{ago .StartedAt}}</p>
+    {{with lastNote .}}<p>{{.}}</p>{{end}}
+  </article>
+  {{end}}
+</section>
+{{end}}
+
+{{range .Groups}}
+<section class="group">
+  {{if .Name}}<h2>{{.Name}}</h2>{{end}}
+  <ul class="services">
+    {{range .Services}}
+    <li class="service">
+      <div class="service-head">
+        <div>
+          <span class="name">{{.Name}}</span>
+          {{if .Description}}<span class="desc">{{.Description}}</span>{{end}}
+        </div>
+        <span class="pill pill-{{.Level}}">{{.Level.Label}}</span>
+      </div>
+      <div class="bars" role="img" aria-label="{{$.UptimeDays}} day uptime history for {{.Name}}">
+        {{range .Days}}<span class="bar bar-{{.Class}}" title="{{.Label}}"></span>{{end}}
+      </div>
+      <div class="bars-legend">
+        <span>{{$.UptimeDays}} days ago</span>
+        <span class="uptime">{{.UptimeLabel}} uptime</span>
+        <span>Today</span>
+      </div>
+      {{with .SLO}}
+      <p class="slo">SLO {{.Target}}% &middot; {{budget .BudgetRemaining}} of error budget left</p>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{else}}
+<p class="empty">No services are configured.</p>
+{{end}}
+
+<section class="incidents">
+  <h2>Past incidents</h2>
+  {{range .Recent}}
+  <article class="incident resolved">
+    <h3><a href="/incidents/{{.ID}}">{{.Title}}</a></h3>
+    <p class="meta">{{$.ServiceName .ServiceID}} &middot; resolved {{date .ResolvedAt}} &middot; lasted {{incidentDuration .}}</p>
+  </article>
+  {{else}}
+  <p class="empty">No incidents in the last 14 days.</p>
+  {{end}}
+</section>
+{{template "foot"}}{{end}}

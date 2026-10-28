@@ -359,6 +359,9 @@ func (c *Config) Validate() error {
 			add("server.public_url must be an absolute URL")
 		}
 	}
+	if t := c.Server.AdminToken; t != "" && len(t) < 16 {
+		add("server.admin_token must be at least 16 characters")
+	}
 	if c.Server.UptimeDays < 1 || c.Server.UptimeDays > 365 {
 		add("server.uptime_days must be between 1 and 365")
 	}
