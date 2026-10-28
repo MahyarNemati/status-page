@@ -86,8 +86,6 @@ jobs:
       - name: Test the store against Postgres
         env:
           STATUSPAGE_TEST_POSTGRES_DSN: "postgres://status:status@localhost:5432/status?sslmode=disable"
-        env:
-          STATUSPAGE_TEST_POSTGRES_DSN: "postgres://status:status@localhost:5432/status?sslmode=disable"
           CGO_ENABLED: 1
         run: go test -race -count=1 ./internal/store/...
 
