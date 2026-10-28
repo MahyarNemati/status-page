@@ -1,228 +1,256 @@
-// Package slo turns probe history into availability objectives and
-// burn-rate alerts.
-//
-// The model is the standard error-budget one. An objective of 99.9% over 30
-// days permits 0.1% of probes to fail; that 0.1% is the error budget. Burn
-// rate is how fast the budget is being spent relative to the rate that would
-// exhaust it exactly at the end of the window: a burn rate of 1 uses the
-// whole budget over the whole window, a burn rate of 14.4 uses it in a day.
-//
-// Alerts use the multi-window technique from the Google SRE workbook: a rule
-// fires only when both a long and a short window exceed the threshold. The
-// long window supplies significance and the short one supplies freshness, so
-// a brief spike does not page and a resolved outage stops paging promptly.
+// Package slo computes availability against per-service objectives, the
+// remaining error budget over a rolling window, and multi-window burn-rate
+// alerts in the style of the Google SRE workbook.
 package slo
 
 import (
 	"context"
 	"fmt"
-	"math"
+	"log/slog"
+	"sort"
+	"sync"
 	"time"
 
+	"github.com/MahyarNemati/status-page/internal/alert"
+	"github.com/MahyarNemati/status-page/internal/clock"
 	"github.com/MahyarNemati/status-page/internal/config"
 	"github.com/MahyarNemati/status-page/internal/store"
 )
 
-// Status is an objective evaluated over its window.
-type Status struct {
-	ServiceID string `json:"service_id"`
-	// Target is the objective in percent, for example 99.9.
-	Target float64       `json:"target"`
-	Window time.Duration `json:"window_ns"`
-	// Availability is the measured percentage, or -1 when there is no data.
+// Burn is the evaluation of one burn-rate rule.
+type Burn struct {
+	Rule      string        `json:"rule"`
+	Severity  string        `json:"severity"`
+	Factor    float64       `json:"factor"`
+	LongWin   time.Duration `json:"long_window_ns"`
+	ShortWin  time.Duration `json:"short_window_ns"`
+	LongRate  float64       `json:"long_rate"`
+	ShortRate float64       `json:"short_rate"`
+	Firing    bool          `json:"firing"`
+}
+
+// Report is the SLO state of one service.
+type Report struct {
+	ServiceID   string        `json:"service_id"`
+	ServiceName string        `json:"service_name"`
+	Target      float64       `json:"target_percent"`
+	Window      time.Duration `json:"window_ns"`
+	Counts      store.Counts  `json:"counts"`
+	// Availability is a ratio in [0,1], or -1 without data.
 	Availability float64 `json:"availability"`
-	// BudgetConsumed is the fraction of the error budget spent, where 1 means
-	// exhausted. It can exceed 1 after a large outage.
-	BudgetConsumed float64 `json:"budget_consumed"`
-	// BudgetRemaining is 1-BudgetConsumed, floored at 0.
-	BudgetRemaining float64 `json:"budget_remaining"`
-	// Breaching reports whether measured availability is below Target.
-	Breaching bool         `json:"breaching"`
-	Counts    store.Counts `json:"counts"`
+	// BudgetTotal is the number of failed checks the window allows.
+	BudgetTotal float64 `json:"budget_total"`
+	// BudgetRemaining is the unspent fraction of the budget; negative once
+	// the objective is breached.
+	BudgetRemaining float64   `json:"budget_remaining"`
+	Burns           []Burn    `json:"burn_rates"`
+	EvaluatedAt     time.Time `json:"evaluated_at"`
 }
 
-// HasData reports whether any probes landed in the window.
-func (s Status) HasData() bool { return s.Counts.Total > 0 }
+// Observer receives every fresh report, e.g. to update metrics.
+type Observer func(Report)
 
-// ErrorBudget returns the permitted failure ratio for a target in percent.
-// A target of 99.9 permits 0.001.
-func ErrorBudget(target float64) float64 {
-	return math.Max(0, (100-target)/100)
+// Evaluator periodically evaluates every service that declares an SLO.
+type Evaluator struct {
+	store    store.Store
+	clock    clock.Clock
+	services []config.Service
+	window   time.Duration
+	rules    []config.BurnRule
+	pub      alert.Publisher
+	url      string
+	observe  Observer
+	log      *slog.Logger
+
+	mu      sync.RWMutex
+	reports map[string]Report
+	firing  map[string]bool
 }
 
-// Evaluate computes the objective for one service over [now-window, now].
-func Evaluate(ctx context.Context, st store.Store, serviceID string, target float64, window time.Duration, now time.Time) (Status, error) {
-	if window <= 0 {
-		return Status{}, fmt.Errorf("slo: window must be positive, got %s", window)
-	}
-	if target <= 0 || target > 100 {
-		return Status{}, fmt.Errorf("slo: target must be in (0,100], got %v", target)
-	}
+// Options configures an Evaluator.
+type Options struct {
+	Store     store.Store
+	Clock     clock.Clock
+	Services  []config.Service
+	Policy    config.SLOPolicy
+	Publisher alert.Publisher
+	PublicURL string
+	Observer  Observer
+	Logger    *slog.Logger
+}
 
-	counts, err := st.RawCounts(ctx, serviceID, now.Add(-window), now)
-	if err != nil {
-		return Status{}, fmt.Errorf("slo: counts for %s: %w", serviceID, err)
+// New returns an Evaluator.
+func New(o Options) *Evaluator {
+	if o.Clock == nil {
+		o.Clock = clock.Real()
 	}
-
-	s := Status{
-		ServiceID: serviceID,
-		Target:    target,
-		Window:    window,
-		Counts:    counts,
+	if o.Publisher == nil {
+		o.Publisher = alert.PublisherFunc(func(alert.Notification) {})
 	}
-	ratio := counts.Ratio()
-	if ratio < 0 {
-		// No data is not 0% availability. Reporting a fresh service as
-		// breaching would page on startup.
-		s.Availability = -1
-		s.BudgetRemaining = 1
-		return s, nil
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.DiscardHandler)
 	}
-
-	s.Availability = ratio * 100
-	budget := ErrorBudget(target)
-	errorRatio := 1 - ratio
-	if budget == 0 {
-		// A 100% objective has no budget: any failure exhausts it.
-		if errorRatio > 0 {
-			s.BudgetConsumed = math.Inf(1)
+	var svcs []config.Service
+	for _, s := range o.Services {
+		if s.SLO != nil {
+			svcs = append(svcs, s)
 		}
-	} else {
-		s.BudgetConsumed = errorRatio / budget
 	}
-	s.BudgetRemaining = math.Max(0, 1-s.BudgetConsumed)
-	// Compare in percent with a small tolerance so float noise at exactly the
-	// target does not flip the verdict.
-	s.Breaching = s.Availability < target-1e-9
-	return s, nil
-}
-
-// BurnRate is the burn rate measured over one window.
-type BurnRate struct {
-	Window time.Duration `json:"window_ns"`
-	// Rate is error ratio divided by error budget. Zero when no probes
-	// landed in the window.
-	Rate   float64      `json:"rate"`
-	Counts store.Counts `json:"counts"`
-}
-
-// Alert is a fired burn-rate rule.
-type Alert struct {
-	ServiceID string   `json:"service_id"`
-	Rule      string   `json:"rule"`
-	Severity  string   `json:"severity"`
-	Factor    float64  `json:"factor"`
-	Long      BurnRate `json:"long"`
-	Short     BurnRate `json:"short"`
-}
-
-// Describe renders the alert as a human sentence for a notification body.
-func (a Alert) Describe() string {
-	return fmt.Sprintf(
-		"Error budget burning at %.1fx over %s and %.1fx over %s (threshold %.1fx). At this rate the budget is exhausted in %s.",
-		a.Long.Rate, humanWindow(a.Long.Window),
-		a.Short.Rate, humanWindow(a.Short.Window),
-		a.Factor, a.exhaustion(),
-	)
-}
-
-func (a Alert) exhaustion() string {
-	if a.Long.Rate <= 0 {
-		return "no time at all"
+	return &Evaluator{
+		store: o.Store, clock: o.Clock, services: svcs, window: o.Policy.Window.D(), rules: o.Policy.BurnRules,
+		pub: o.Publisher, url: o.PublicURL, observe: o.Observer, log: o.Logger,
+		reports: map[string]Report{}, firing: map[string]bool{},
 	}
-	return humanWindow(time.Duration(float64(a.Long.Window) / a.Long.Rate))
 }
 
-// burnRate measures the burn rate over [now-window, now].
-func burnRate(ctx context.Context, st store.Store, serviceID string, target float64, window time.Duration, now time.Time) (BurnRate, error) {
-	counts, err := st.RawCounts(ctx, serviceID, now.Add(-window), now)
-	if err != nil {
-		return BurnRate{}, fmt.Errorf("slo: burn counts for %s: %w", serviceID, err)
-	}
-	br := BurnRate{Window: window, Counts: counts}
-	ratio := counts.Ratio()
-	if ratio < 0 {
-		return br, nil // no data burns nothing
-	}
-	budget := ErrorBudget(target)
-	errorRatio := 1 - ratio
-	switch {
-	case budget > 0:
-		br.Rate = errorRatio / budget
-	case errorRatio > 0:
-		br.Rate = math.Inf(1)
-	}
-	return br, nil
-}
-
-// EvaluateBurn checks every rule and returns those that fire. A rule fires
-// only when the long and short windows both exceed Factor.
-//
-// Rules are evaluated in order and only the first (most severe) match is
-// returned, so one outage produces one page rather than one per rule. Order
-// your rules fastest-burn first.
-func EvaluateBurn(ctx context.Context, st store.Store, serviceID string, target float64, rules []config.BurnRule, now time.Time) ([]Alert, error) {
-	var fired []Alert
-	for _, r := range rules {
-		long, short := r.Long.D(), r.Short.D()
-		if long <= 0 || short <= 0 || r.Factor <= 0 {
-			return nil, fmt.Errorf("slo: burn rule %q needs positive long, short and factor", r.Name)
+// Run evaluates immediately and then every interval until ctx is done.
+func (e *Evaluator) Run(ctx context.Context, every time.Duration) {
+	for {
+		if err := e.Evaluate(ctx); err != nil && ctx.Err() == nil {
+			e.log.Error("slo evaluation failed", "err", err)
 		}
-		if short > long {
-			return nil, fmt.Errorf("slo: burn rule %q has short window (%s) longer than long window (%s)", r.Name, short, long)
+		if !clock.Sleep(e.clock, every, ctx.Done()) {
+			return
 		}
+	}
+}
 
-		lb, err := burnRate(ctx, st, serviceID, target, long, now)
+// Evaluate recomputes every report and publishes burn-rate transitions.
+func (e *Evaluator) Evaluate(ctx context.Context) error {
+	now := e.clock.Now()
+	for _, svc := range e.services {
+		r, err := e.evaluate(ctx, svc, now)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("service %s: %w", svc.ID, err)
 		}
-		// Require data in the long window: an empty window must not fire.
-		if lb.Counts.Total == 0 || lb.Rate < r.Factor {
-			continue
+		e.mu.Lock()
+		e.reports[svc.ID] = r
+		e.mu.Unlock()
+		e.transitions(svc, r, now)
+		if e.observe != nil {
+			e.observe(r)
 		}
-		sb, err := burnRate(ctx, st, serviceID, target, short, now)
-		if err != nil {
-			return nil, err
-		}
-		if sb.Counts.Total == 0 || sb.Rate < r.Factor {
-			// Long window is hot but the short one has cooled: the outage is
-			// over. Not firing here is what stops a resolved incident paging
-			// for the rest of the long window.
-			continue
-		}
+	}
+	return nil
+}
 
-		sev := r.Severity
-		if sev == "" {
-			sev = "warning"
+func (e *Evaluator) evaluate(ctx context.Context, svc config.Service, now time.Time) (Report, error) {
+	r := Report{
+		ServiceID: svc.ID, ServiceName: svc.Name, Target: svc.SLO.Target, Window: e.window, EvaluatedAt: now,
+	}
+	counts, err := e.windowCounts(ctx, svc.ID, now)
+	if err != nil {
+		return r, err
+	}
+	allowed := 1 - svc.SLO.Target/100
+	r.Counts = counts
+	r.Availability = counts.Ratio()
+	r.BudgetTotal = allowed * float64(counts.Total)
+	r.BudgetRemaining = 1
+	if r.BudgetTotal > 0 {
+		r.BudgetRemaining = 1 - float64(counts.Down())/r.BudgetTotal
+	}
+
+	for _, rule := range e.rules {
+		long, err := e.burnRate(ctx, svc.ID, now, rule.Long.D(), allowed)
+		if err != nil {
+			return r, err
 		}
-		fired = append(fired, Alert{
-			ServiceID: serviceID,
-			Rule:      r.Name,
-			Severity:  sev,
-			Factor:    r.Factor,
-			Long:      lb,
-			Short:     sb,
+		short, err := e.burnRate(ctx, svc.ID, now, rule.Short.D(), allowed)
+		if err != nil {
+			return r, err
+		}
+		r.Burns = append(r.Burns, Burn{
+			Rule: rule.Name, Severity: rule.Severity, Factor: rule.Factor,
+			LongWin: rule.Long.D(), ShortWin: rule.Short.D(), LongRate: long, ShortRate: short,
+			Firing: long >= rule.Factor && short >= rule.Factor,
 		})
-		break
 	}
-	return fired, nil
+	return r, nil
 }
 
-func humanWindow(d time.Duration) string {
-	switch {
-	case d <= 0:
-		return "0s"
-	case d >= 24*time.Hour:
-		days := d.Hours() / 24
-		if days >= 2 {
-			return fmt.Sprintf("%.0fd", days)
-		}
-		return fmt.Sprintf("%.1fd", days)
-	case d >= time.Hour:
-		return fmt.Sprintf("%.0fh", d.Hours())
-	case d >= time.Minute:
-		return fmt.Sprintf("%.0fm", d.Minutes())
-	default:
-		return d.Round(time.Second).String()
+// windowCounts sums hourly rollups from the hour containing the window
+// start and raw results for the current partial hour. The window can
+// therefore extend up to one hour further back than configured, which keeps
+// it independent of raw retention.
+func (e *Evaluator) windowCounts(ctx context.Context, id string, now time.Time) (store.Counts, error) {
+	first := store.Hourly.Truncate(now.Add(-e.window))
+	current := store.Hourly.Truncate(now)
+	buckets, err := e.store.Rollups(ctx, id, store.Hourly, first, current)
+	if err != nil {
+		return store.Counts{}, err
 	}
+	var c store.Counts
+	for _, b := range buckets {
+		c = c.Add(b.Counts)
+	}
+	tail, err := e.store.RawCounts(ctx, id, current, now.Add(time.Millisecond))
+	if err != nil {
+		return store.Counts{}, err
+	}
+	return c.Add(tail), nil
+}
+
+// burnRate is the observed error ratio over the window divided by the error
+// ratio the objective allows. A rate of 1 spends the budget exactly over
+// the SLO window.
+func (e *Evaluator) burnRate(ctx context.Context, id string, now time.Time, win time.Duration, allowed float64) (float64, error) {
+	// RawCounts is half-open, so shift by the storage resolution to get (now-win, now].
+	c, err := e.store.RawCounts(ctx, id, now.Add(-win+time.Millisecond), now.Add(time.Millisecond))
+	if err != nil {
+		return 0, err
+	}
+	if c.Total == 0 || allowed <= 0 {
+		return 0, nil
+	}
+	return (float64(c.Down()) / float64(c.Total)) / allowed, nil
+}
+
+func (e *Evaluator) transitions(svc config.Service, r Report, now time.Time) {
+	for _, b := range r.Burns {
+		key := "slo:" + svc.ID + ":" + b.Rule
+		e.mu.Lock()
+		was := e.firing[key]
+		e.firing[key] = b.Firing
+		e.mu.Unlock()
+		if was == b.Firing {
+			continue
+		}
+		n := alert.Notification{
+			Key: key, ServiceID: svc.ID, ServiceName: svc.Name, Severity: b.Severity,
+			Title: fmt.Sprintf("%s is burning its error budget (%s)", svc.Name, b.Rule),
+			URL:   e.url, At: now, Channels: svc.Alerts,
+		}
+		if b.Firing {
+			n.Kind = alert.BurnRateFiring
+			n.Message = fmt.Sprintf("Burn rate %.1fx over %s and %.1fx over %s exceeds %.1fx. %.1f%% of the %s budget remains.",
+				b.LongRate, b.LongWin, b.ShortRate, b.ShortWin, b.Factor, r.BudgetRemaining*100, e.window)
+			e.log.Warn("burn rate alert firing", "service", svc.ID, "rule", b.Rule, "long", b.LongRate, "short", b.ShortRate)
+		} else {
+			n.Kind = alert.BurnRateResolved
+			n.Message = fmt.Sprintf("Burn rate back below %.1fx.", b.Factor)
+			e.log.Info("burn rate alert resolved", "service", svc.ID, "rule", b.Rule)
+		}
+		e.pub.Publish(n)
+	}
+}
+
+// Reports returns the latest reports sorted by service id.
+func (e *Evaluator) Reports() []Report {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]Report, 0, len(e.reports))
+	for _, r := range e.reports {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ServiceID < out[j].ServiceID })
+	return out
+}
+
+// Report returns the latest report for one service.
+func (e *Evaluator) Report(id string) (Report, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	r, ok := e.reports[id]
+	return r, ok
 }
