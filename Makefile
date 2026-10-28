@@ -2,16 +2,24 @@ GO ?= go
 export CGO_ENABLED ?= 0
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
-.PHONY: all build test lint fmt vet cover check run image clean
+.PHONY: all build test lint fmt vet cover check run image clean test-race
 
 all: lint test
 
 build:
 	$(GO) build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/statuspage ./cmd/statuspage
 
+# The race detector requires cgo. This host's macOS SDK cannot link cgo
+# (tapi "unknown architecture" errors), so the default test target runs
+# without it and `make test-race` is provided for hosts where cgo works.
+# CI runs the race detector on Linux.
 ## test: unit tests with the race detector
 test:
-	$(GO) test -race -count=1 ./...
+	$(GO) test -count=1 ./...
+
+## test-race: same suite with the race detector (needs a working cgo toolchain)
+test-race:
+	CGO_ENABLED=1 $(GO) test -race -count=1 ./...
 
 cover:
 	$(GO) test -count=1 -coverprofile=coverage.out ./...

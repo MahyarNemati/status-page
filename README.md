@@ -224,8 +224,9 @@ surface of the final image to one static binary.
 ## Development
 
 ```bash
-make test     # race detector on
-make lint     # gofmt + vet
+make test      # unit tests
+make test-race # the same with the race detector (needs working cgo)
+make lint      # gofmt + vet
 make build    # static binary in bin/
 make check    # validate config.yaml
 make image
@@ -237,8 +238,10 @@ the store suite against a real Postgres service container, because placeholder
 syntax and upsert behaviour differ from SQLite, and builds the image then
 fetches `/`, `/api/v1/status` and `/metrics` from the running container.
 
-Everything is pure Go (`modernc.org/sqlite`), so `CGO_ENABLED=0` is set
-throughout and the image is static.
+The runtime is pure Go (`modernc.org/sqlite`), so release builds and the
+Docker image set `CGO_ENABLED=0` and the binary is static. Tests are the
+exception: the **race detector requires cgo**, so `make test` runs without it
+and `make test-race` enables it. CI runs the race detector on Linux.
 
 ## Limitations
 

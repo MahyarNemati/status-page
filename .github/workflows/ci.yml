@@ -13,8 +13,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CGO_ENABLED: 0
+# NOTE: CGO_ENABLED is deliberately NOT forced to 0 here. The race detector
+# requires cgo, and the Linux runners have a working toolchain. Static builds
+# set CGO_ENABLED=0 per-step instead.
 
 jobs:
   test:
@@ -41,6 +42,8 @@ jobs:
       - run: go vet ./...
       - run: go build ./...
       - name: Test (race)
+        env:
+          CGO_ENABLED: 1   # the race detector needs cgo
         run: go test -race -count=1 ./...
 
       # A config file that no longer parses is a release-breaking bug the unit
@@ -83,6 +86,9 @@ jobs:
       - name: Test the store against Postgres
         env:
           STATUSPAGE_TEST_POSTGRES_DSN: "postgres://status:status@localhost:5432/status?sslmode=disable"
+        env:
+          STATUSPAGE_TEST_POSTGRES_DSN: "postgres://status:status@localhost:5432/status?sslmode=disable"
+          CGO_ENABLED: 1
         run: go test -race -count=1 ./internal/store/...
 
   docker:
