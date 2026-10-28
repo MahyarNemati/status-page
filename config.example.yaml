@@ -1,0 +1,169 @@
+# status-page configuration.
+#
+# Every value below is optional unless noted; the defaults shown in comments
+# are what you get by omitting the key.
+#
+# Values of the form dollar-brace NAME brace are expanded from the environment,
+# and startup fails if the variable is unset, so a missing secret is a loud
+# error rather than an empty string. Note that expansion runs over the whole
+# file including comments, so do not write such a reference in a comment
+# unless that variable is really set.
+
+server:
+  listen: ":8080"                 # default ":8080"
+  title: "Acme Status"            # default "Service Status"
+  public_url: "https://status.acme.example"   # absolute URL; used in alert links
+  # Guards the admin API (declaring incidents by hand). Must be >= 16 chars.
+  # Leave unset to disable the admin API entirely.
+  admin_token: "${STATUSPAGE_ADMIN_TOKEN}"
+  page_cache_ttl: "5s"            # default "5s"; 0 disables caching
+  uptime_days: 90                 # default 90; size of the history strip (1-365)
+
+storage:
+  driver: "sqlite"                # "sqlite" or "postgres"
+  dsn: "file:statuspage.db?_pragma=journal_mode(WAL)"
+  # For Postgres, set:
+  #   driver: "postgres"
+  #   dsn: <an environment reference, or the URL inline>
+  retention:
+    raw: "7d"                     # must cover the longest burn-rate window below
+    hourly: "90d"
+    daily: "400d"                 # must cover server.uptime_days
+    every: "1h"                   # how often to prune
+
+scheduler:
+  workers: 8                      # max concurrent probes (1-1024)
+  jitter: 0.1                     # fraction of the interval, 0-0.5
+
+# Per-service values override these.
+defaults:
+  interval: "60s"
+  timeout: "10s"
+  retries: 1                      # extra attempts before a probe counts as down
+  retry_delay: "2s"
+  failure_threshold: 2            # consecutive failures before an incident opens
+  recovery_threshold: 2           # consecutive successes before it resolves
+
+incidents:
+  flap_window: "15m"
+  flap_threshold: 4               # >= 2; this many flips in the window = flapping
+
+slo:
+  window: "30d"                   # objective measurement window
+  evaluate_every: "1m"
+  # Multi-window burn-rate alerting. A rule fires only when BOTH windows
+  # exceed factor: the long window gives significance, the short one gives
+  # freshness. Order fastest-burn first; only the first match alerts.
+  burn_rules:
+    - name: "fast"
+      long: "1h"
+      short: "5m"
+      factor: 14.4                # burns a 30d budget in ~2 days
+      severity: "critical"
+    - name: "slow"
+      long: "6h"
+      short: "30m"
+      factor: 6
+      severity: "warning"
+
+alerts:
+  dedupe_window: "30m"            # repeats of the same alert are suppressed
+  timeout: "10s"
+  channels:
+    - name: "ops-slack"
+      type: "slack"
+      url: "${SLACK_WEBHOOK_URL}"
+
+    - name: "ops-discord"
+      type: "discord"
+      url: "${DISCORD_WEBHOOK_URL}"
+
+    # Generic webhook. With a secret, the body is signed with HMAC-SHA256 and
+    # sent in X-Signature-256 as "sha256=<hex>".
+    - name: "pager"
+      type: "webhook"
+      url: "https://events.pagerduty.example/hook"
+      secret: "${PAGER_WEBHOOK_SECRET}"
+      headers:
+        X-Routing-Key: "${PAGER_ROUTING_KEY}"
+
+    - name: "email"
+      type: "email"
+      smtp:
+        host: "smtp.example.com"
+        port: 587
+        username: "${SMTP_USER}"
+        password: "${SMTP_PASS}"
+        from: "status@acme.example"
+        to:
+          - "oncall@acme.example"
+
+services:
+  - id: "www"                     # required, unique, used in URLs and metrics
+    name: "Website"
+    group: "Public"               # services are grouped on the page
+    description: "Marketing site and docs"
+    type: "http"
+    target: "https://acme.example/"
+    interval: "30s"
+    alerts: ["ops-slack", "email"]   # empty/omitted = every channel
+    slo:
+      target: 99.9                # percent
+    http:
+      method: "GET"
+      expect_status: [200, 301]   # default: 200-299
+      keyword: "Acme"             # body must contain this
+      # keyword_absent: true      # invert: body must NOT contain it
+      follow_redirects: true
+      tls_expiry_warn: "14d"      # degrade when the cert expires sooner
+      headers:
+        User-Agent: "status-page"
+
+  - id: "api"
+    name: "API"
+    group: "Public"
+    type: "http"
+    target: "https://api.acme.example/healthz"
+    interval: "15s"
+    degraded_latency: "800ms"     # slower than this = degraded, not down
+    failure_threshold: 3
+    alerts: ["ops-slack", "pager"]
+    slo:
+      target: 99.95
+
+  - id: "postgres"
+    name: "Primary database"
+    group: "Internal"
+    type: "tcp"
+    target: "db.internal:5432"
+    interval: "30s"
+    degraded_latency: "200ms"
+    alerts: ["ops-slack"]
+
+  - id: "dns"
+    name: "Authoritative DNS"
+    group: "Internal"
+    type: "dns"
+    target: "acme.example"
+    dns:
+      record: "A"
+      server: "1.1.1.1:53"        # omit to use the system resolver
+      expect: ["203.0.113.10"]    # answer must contain these
+
+  - id: "edge"
+    name: "Edge router"
+    group: "Internal"
+    type: "icmp"
+    target: "192.0.2.1"
+    icmp:
+      # Raw ICMP needs root or CAP_NET_RAW. Leave false to use an
+      # unprivileged UDP ping, which works as a normal user on macOS and on
+      # Linux when net.ipv4.ping_group_range permits it.
+      privileged: false
+
+  - id: "internal-admin"
+    name: "Admin console"
+    group: "Internal"
+    type: "http"
+    target: "https://admin.internal/healthz"
+    hidden: true                  # monitored and alerted, but not shown publicly

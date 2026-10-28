@@ -1,0 +1,55 @@
+# Default: SQLite on a volume, no other services needed.
+#
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# To use Postgres instead, uncomment the postgres service and the two
+# STATUSPAGE_DB_* variables below.
+
+services:
+  statuspage:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    ports:
+      - "8080:8080"
+    environment:
+      # Must be at least 16 characters or config validation fails.
+      STATUSPAGE_ADMIN_TOKEN: "change-me-at-least-16-chars"
+      # config.example.yaml references these, and startup fails on an unset
+      # reference by design. Replace them with real webhooks to get alerts;
+      # the placeholders only let the stack boot.
+      SLACK_WEBHOOK_URL: "https://hooks.slack.example/replace-me"
+      DISCORD_WEBHOOK_URL: "https://discord.example/api/webhooks/replace-me"
+      PAGER_WEBHOOK_SECRET: "replace-me"
+      PAGER_ROUTING_KEY: "replace-me"
+      SMTP_USER: "replace-me"
+      SMTP_PASS: "replace-me"
+      # STATUSPAGE_DB_DRIVER: postgres
+      # STATUSPAGE_DB_DSN: "postgres://status:status@postgres:5432/status?sslmode=disable"
+    volumes:
+      - ./config.example.yaml:/etc/statuspage/config.yaml:ro
+      - data:/data
+    restart: unless-stopped
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+
+  # postgres:
+  #   image: postgres:17-alpine
+  #   environment:
+  #     POSTGRES_USER: status
+  #     POSTGRES_PASSWORD: status
+  #     POSTGRES_DB: status
+  #   volumes:
+  #     - pgdata:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U status -d status"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 10
+
+volumes:
+  data:
+  # pgdata:

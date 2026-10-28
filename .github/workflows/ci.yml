@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: 0
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24', '1.25']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+      - name: Test (race)
+        run: go test -race -count=1 ./...
+
+      # A config file that no longer parses is a release-breaking bug the unit
+      # tests cannot see, so the shipped example is validated on every push.
+      - name: Validate the example config
+        env:
+          STATUSPAGE_ADMIN_TOKEN: ci-token-at-least-16-chars
+          SLACK_WEBHOOK_URL: https://hooks.slack.example/x
+          DISCORD_WEBHOOK_URL: https://discord.example/api/webhooks/x
+          PAGER_WEBHOOK_SECRET: ci-secret
+          PAGER_ROUTING_KEY: ci-key
+          SMTP_USER: ci
+          SMTP_PASS: ci
+        run: go run ./cmd/statuspage -config config.example.yaml -check-config
+
+  postgres:
+    name: store against postgres
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: status
+          POSTGRES_PASSWORD: status
+          POSTGRES_DB: status
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U status -d status"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      # The SQL store targets both drivers; placeholder syntax and upsert
+      # behaviour differ, so SQLite passing does not imply Postgres passing.
+      - name: Test the store against Postgres
+        env:
+          STATUSPAGE_TEST_POSTGRES_DSN: "postgres://status:status@localhost:5432/status?sslmode=disable"
+        run: go test -race -count=1 ./internal/store/...
+
+  docker:
+    name: image builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: status-page:ci
+      - name: Serve the example config and fetch the page
+        env:
+          STATUSPAGE_ADMIN_TOKEN: ci-token-at-least-16-chars
+          SLACK_WEBHOOK_URL: https://hooks.slack.example/x
+          DISCORD_WEBHOOK_URL: https://discord.example/api/webhooks/x
+          PAGER_WEBHOOK_SECRET: ci-secret
+          PAGER_ROUTING_KEY: ci-key
+          SMTP_USER: ci
+          SMTP_PASS: ci
+        run: |
+          docker run -d --name sp -p 8080:8080 \
+            -e STATUSPAGE_ADMIN_TOKEN -e SLACK_WEBHOOK_URL -e DISCORD_WEBHOOK_URL \
+            -e PAGER_WEBHOOK_SECRET -e PAGER_ROUTING_KEY -e SMTP_USER -e SMTP_PASS \
+            -v "$PWD/config.example.yaml:/etc/statuspage/config.yaml:ro" \
+            status-page:ci
+          for i in $(seq 1 30); do
+            if curl -fsS localhost:8080/healthz >/dev/null; then echo "up"; break; fi
+            sleep 2
+          done
+          curl -fsS localhost:8080/ | grep -qi '<html' || { echo "page did not render"; exit 1; }
+          curl -fsS localhost:8080/api/v1/status >/dev/null
+          curl -fsS localhost:8080/metrics | head -5
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs sp
+      - name: Tear down
+        if: always()
+        run: docker rm -f sp || true
+
+  tidy:
+    name: go.mod is tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go mod tidy
+      - run: git diff --exit-code go.mod go.sum
